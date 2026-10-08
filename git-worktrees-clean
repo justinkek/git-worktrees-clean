@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+#
+# git-worktrees-clean [<worktree-path>]
+#
+# Removes each linked worktree whose branch's work has reached origin's default
+# branch, then deletes that branch. With a path, checks only that worktree.
+# Uses git only, so it works the same with any hosting provider.
+
+set -uo pipefail
+
+usage() {
+  cat <<'USAGE'
+usage: git worktrees-clean [<worktree-path>]
+
+Removes each linked worktree whose branch's work has reached origin's default
+branch, and deletes the branch. With a path, checks only that worktree.
+
+A branch counts as merged when merging it into origin's default branch would
+change nothing, or when a commit on the default branch has the same diff as
+the whole branch (a squash merge).
+
+A worktree is kept when it is locked, has no branch checked out, has
+uncommitted changes or untracked files, or its branch's work is not on the
+default branch. Files matched by ignore rules do not keep a worktree.
+
+Exit codes:
+  0  finished (with a path: the worktree and its branch were removed)
+  1  with a path: the worktree was kept, and the reason is printed
+  2  usage error, or the path is not a worktree of this repository
+  3  not in a git repository, no origin default branch, or git is older than 2.38
+USAGE
+}
+
+fail() {
+  printf 'git worktrees-clean: %s\n' "$1" >&2
+  exit "$2"
+}
+
+requested_path=""
+case $# in
+  0) ;;
+  1)
+    case "$1" in
+      -h | --help) usage; exit 0 ;;
+      -*) usage >&2; exit 2 ;;
+      *) requested_path="$1" ;;
+    esac
+    ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+# A relative path is read from where the command was run, before moving to the
+# main checkout.
+if [ -n "$requested_path" ]; then
+  if [ -d "$requested_path" ]; then
+    requested_path="$(cd "$requested_path" && pwd -P)"
+  else
+    case "$requested_path" in
+      /*) ;;
+      *) requested_path="$PWD/$requested_path" ;;
+    esac
+  fi
+fi
+
+common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ||
+  fail "not inside a git repository." 3
+main_checkout="$(dirname "$common_dir")"
+cd "$main_checkout" || fail "cannot enter the main checkout at $main_checkout." 3
+
+git merge-tree --write-tree HEAD HEAD > /dev/null 2>&1 ||
+  fail "needs git 2.38 or later for 'git merge-tree --write-tree'." 3
+
+default_reference="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)"
+default_branch="${default_reference#origin/}"
+[ -n "$default_branch" ] || default_branch=main
+target="origin/$default_branch"
+
+git fetch --quiet origin "$default_branch" 2>/dev/null ||
+  printf 'git worktrees-clean: could not fetch %s, checking against the copy already on disk\n' "$target" >&2
+
+git rev-parse --verify --quiet "$target^{commit}" > /dev/null ||
+  fail "$target does not exist. Set it with 'git remote set-head origin --auto'." 3
+target_tree="$(git rev-parse "$target^{tree}")"
+
+# True when the branch's work is on the default branch: merging it would change
+# nothing, or a commit since the fork point has the same diff as the whole branch.
+is_merged() {
+  local branch="$1" merged_tree fork_point branch_fingerprint
+
+  if merged_tree="$(git merge-tree --write-tree "$target" "$branch" 2>/dev/null)" &&
+    [ "${merged_tree%%$'\n'*}" = "$target_tree" ]; then
+    return 0
+  fi
+
+  fork_point="$(git merge-base "$target" "$branch" 2>/dev/null)" || return 1
+  branch_fingerprint="$(git diff "$fork_point" "$branch" | git patch-id --stable | cut -d' ' -f1)"
+  [ -n "$branch_fingerprint" ] || return 1
+
+  git log --patch --no-merges --format='commit %H' "$fork_point..$target" |
+    git patch-id --stable | cut -d' ' -f1 | grep --quiet --line-regexp --fixed-strings "$branch_fingerprint"
+}
+
+removed=""
+kept=""
+vanished=""
+
+keep() {
+  kept="${kept}$1"$'\n'
+}
+
+check_worktree() {
+  local worktree_path="$1" branch="$2" locked="$3" outstanding
+
+  if [ -n "$locked" ]; then
+    keep "$worktree_path${branch:+ ($branch)} - locked"
+    return
+  fi
+
+  if [ -z "$branch" ]; then
+    keep "$worktree_path - no branch checked out"
+    return
+  fi
+
+  if [ "$branch" = "$default_branch" ]; then
+    keep "$worktree_path ($branch) - the default branch"
+    return
+  fi
+
+  # A directory that is already gone is handled once git's record of it is
+  # pruned, since git will not delete a branch a worktree record still holds.
+  if [ ! -d "$worktree_path" ]; then
+    vanished="${vanished}${worktree_path}"$'\t'"${branch}"$'\n'
+    return
+  fi
+
+  if ! outstanding="$(git -C "$worktree_path" status --porcelain 2>/dev/null)"; then
+    keep "$worktree_path ($branch) - cannot read its working tree"
+    return
+  fi
+  if [ -n "$outstanding" ]; then
+    keep "$worktree_path ($branch) - uncommitted changes or untracked files"
+    return
+  fi
+
+  if ! is_merged "$branch"; then
+    keep "$worktree_path ($branch) - work not on $target"
+    return
+  fi
+
+  if ! git worktree remove "$worktree_path" 2>/dev/null; then
+    keep "$worktree_path ($branch) - git would not remove the worktree"
+    return
+  fi
+  if ! git branch --delete --force --quiet "$branch"; then
+    keep "$worktree_path ($branch) - worktree removed, but git would not delete the branch"
+    return
+  fi
+  removed="${removed}${worktree_path} ($branch)"$'\n'
+}
+
+check_vanished() {
+  local worktree_path branch
+
+  [ -n "$vanished" ] || return
+  git worktree prune
+
+  while IFS=$'\t' read -r worktree_path branch; do
+    [ -n "$worktree_path" ] || continue
+    if ! is_merged "$branch"; then
+      keep "$worktree_path ($branch) - directory already gone, branch kept: work not on $target"
+    elif git branch --delete --force --quiet "$branch"; then
+      removed="${removed}${worktree_path} ($branch) - directory was already gone"$'\n'
+    else
+      keep "$worktree_path ($branch) - directory already gone, but git would not delete the branch"
+    fi
+  done <<< "$vanished"
+}
+
+found_requested=""
+worktree_path=""
+branch=""
+locked=""
+while IFS= read -r line; do
+  case "$line" in
+    "worktree "*)
+      worktree_path="${line#worktree }"
+      branch=""
+      locked=""
+      ;;
+    "branch refs/heads/"*)
+      branch="${line#branch refs/heads/}"
+      ;;
+    "locked"*)
+      locked=yes
+      ;;
+    "")
+      if [ -n "$worktree_path" ] && [ "$worktree_path" != "$main_checkout" ]; then
+        if [ -z "$requested_path" ]; then
+          check_worktree "$worktree_path" "$branch" "$locked"
+        elif [ "$worktree_path" = "$requested_path" ]; then
+          found_requested=yes
+          check_worktree "$worktree_path" "$branch" "$locked"
+        fi
+      fi
+      worktree_path=""
+      ;;
+  esac
+done < <(git worktree list --porcelain; printf '\n')
+
+if [ -n "$requested_path" ] && [ -z "$found_requested" ]; then
+  fail "$requested_path is not a linked worktree of this repository." 2
+fi
+
+check_vanished
+
+print_group() {
+  local label="$1" body="$2" count=0
+
+  [ -n "$body" ] && count="$(printf '%s' "$body" | grep --count '')"
+  printf '%s %d\n' "$label" "$count"
+  [ -n "$body" ] && printf '%s' "$body" | sed 's/^/  /'
+  return 0
+}
+
+print_group removed "$removed"
+print_group kept "$kept"
+
+[ -z "$requested_path" ] || [ -z "$kept" ]
