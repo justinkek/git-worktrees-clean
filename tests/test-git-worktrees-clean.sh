@@ -183,8 +183,15 @@ make_repository "$one"
 make_worktree "$one" first
 make_worktree "$one" second
 make_worktree "$one" unmerged
+make_worktree "$one" locked
+make_worktree "$one" locked-dirty
 on_main "$one" merge --quiet --no-edit first
 on_main "$one" merge --quiet --no-edit second
+on_main "$one" merge --quiet --no-edit locked
+on_main "$one" merge --quiet --no-edit locked-dirty
+on_main "$one" worktree lock --reason "claude session" "$one/locked"
+on_main "$one" worktree lock --reason "claude session" "$one/locked-dirty"
+printf 'edited\n' >> "$one/locked-dirty/locked-dirty.txt"
 on_main "$one" push --quiet origin main
 
 (cd "$one/second" && "$CLEAN" ../first > /dev/null 2>&1)
@@ -205,6 +212,28 @@ if [ "$status" -eq 2 ]; then ok "exits 2 for a path that is not a worktree"; els
 (cd "$one/checkout" && "$CLEAN" "$one/checkout" > /dev/null 2>&1)
 status=$?
 if [ "$status" -eq 2 ]; then ok "exits 2 for the main checkout"; else ko "exits $status for the main checkout"; fi
+
+(cd "$one/checkout" && "$CLEAN" "$one/locked" > /dev/null 2>&1)
+status=$?
+if [ "$status" -eq 1 ]; then ok "a path alone keeps a locked worktree"; else ko "exits $status for a locked worktree without --include-locked"; fi
+
+(cd "$one/checkout" && "$CLEAN" --include-locked "$one/locked" > /dev/null 2>&1)
+status=$?
+if [ "$status" -eq 0 ]; then ok "exits 0 with --include-locked"; else ko "exits $status with --include-locked"; fi
+assert_gone "--include-locked removes a locked merged worktree" "$one" locked
+
+(cd "$one/checkout" && "$CLEAN" --include-locked "$one/locked-dirty" > /dev/null 2>&1)
+status=$?
+if [ "$status" -eq 1 ]; then ok "--include-locked still keeps uncommitted changes"; else ko "exits $status for a locked worktree with uncommitted changes"; fi
+if on_main "$one" worktree list --porcelain | grep --quiet "^locked claude session$"; then
+  ok "a kept worktree keeps its lock and its reason"
+else
+  ko "a kept worktree lost its lock"
+fi
+
+(cd "$one/checkout" && "$CLEAN" --include-locked > /dev/null 2>&1)
+status=$?
+if [ "$status" -eq 2 ]; then ok "exits 2 for --include-locked without a path"; else ko "exits $status for --include-locked without a path"; fi
 
 printf "\n%d passed, %d failed\n" "$pass" "$fail"
 [ "$fail" -eq 0 ]

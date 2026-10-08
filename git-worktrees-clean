@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# git-worktrees-clean [<worktree-path>]
+# git-worktrees-clean [--include-locked <worktree-path> | <worktree-path>]
 #
 # Removes each linked worktree whose branch's work has reached origin's default
 # branch, then deletes that branch. With a path, checks only that worktree.
@@ -11,9 +11,12 @@ set -uo pipefail
 usage() {
   cat <<'USAGE'
 usage: git worktrees-clean [<worktree-path>]
+       git worktrees-clean --include-locked <worktree-path>
 
 Removes each linked worktree whose branch's work has reached origin's default
 branch, and deletes the branch. With a path, checks only that worktree.
+--include-locked also removes that one worktree when it is locked; the other
+checks still apply.
 
 A branch counts as merged when merging it into origin's default branch would
 change nothing, or when a commit on the default branch has the same diff as
@@ -37,17 +40,21 @@ fail() {
 }
 
 requested_path=""
-case $# in
-  0) ;;
-  1)
-    case "$1" in
-      -h | --help) usage; exit 0 ;;
-      -*) usage >&2; exit 2 ;;
-      *) requested_path="$1" ;;
-    esac
-    ;;
-  *) usage >&2; exit 2 ;;
-esac
+include_locked=""
+for argument in "$@"; do
+  case "$argument" in
+    -h | --help) usage; exit 0 ;;
+    --include-locked) include_locked=yes ;;
+    -*) usage >&2; exit 2 ;;
+    *)
+      [ -z "$requested_path" ] || { usage >&2; exit 2; }
+      requested_path="$argument"
+      ;;
+  esac
+done
+if [ -n "$include_locked" ] && [ -z "$requested_path" ]; then
+  fail "--include-locked needs a worktree path." 2
+fi
 
 # A relative path is read from where the command was run, before moving to the
 # main checkout.
@@ -111,7 +118,7 @@ keep() {
 check_worktree() {
   local worktree_path="$1" branch="$2" locked="$3" outstanding
 
-  if [ -n "$locked" ]; then
+  if [ -n "$locked" ] && [ -z "$include_locked" ]; then
     keep "$worktree_path${branch:+ ($branch)} - locked"
     return
   fi
@@ -147,7 +154,11 @@ check_worktree() {
     return
   fi
 
+  # Unlocking first keeps git's own cleanliness check on the removal, and the
+  # lock goes back on if git refuses.
+  [ -z "$locked" ] || git worktree unlock "$worktree_path"
   if ! git worktree remove "$worktree_path" 2>/dev/null; then
+    [ -z "$locked" ] || git worktree lock ${lock_reason:+--reason "$lock_reason"} "$worktree_path"
     keep "$worktree_path ($branch) - git would not remove the worktree"
     return
   fi
@@ -180,18 +191,25 @@ found_requested=""
 worktree_path=""
 branch=""
 locked=""
+lock_reason=""
 while IFS= read -r line; do
   case "$line" in
     "worktree "*)
       worktree_path="${line#worktree }"
       branch=""
       locked=""
+      lock_reason=""
       ;;
     "branch refs/heads/"*)
       branch="${line#branch refs/heads/}"
       ;;
-    "locked"*)
+    "locked")
       locked=yes
+      lock_reason=""
+      ;;
+    "locked "*)
+      locked=yes
+      lock_reason="${line#locked }"
       ;;
     "")
       if [ -n "$worktree_path" ] && [ "$worktree_path" != "$main_checkout" ]; then

@@ -28,7 +28,11 @@ git worktrees-clean
 git worktrees-clean ../my-feature
 ```
 
-With no argument it checks every linked worktree of the current repository. With a path it checks only that worktree. It first fetches the default branch from `origin`, then prints what it did:
+```bash
+git worktrees-clean --include-locked ../my-feature
+```
+
+With no argument it checks every linked worktree of the current repository. With a path it checks only that worktree. `--include-locked` also removes that one worktree when it is locked, for a tool that locks its own worktrees while it works in them. Every other check still applies, and a worktree that is kept keeps its lock. It first fetches the default branch from `origin`, then prints what it did:
 
 ```
 removed 2
@@ -56,7 +60,7 @@ A branch counts as merged when either check passes:
 
 ## What keeps a worktree
 
-1. It is locked (`git worktree lock`).
+1. It is locked (`git worktree lock`), unless it was named with `--include-locked`.
 2. It has no branch checked out.
 3. It has uncommitted changes or untracked files. Files matched by ignore rules, such as `node_modules/`, do not keep it.
 4. Its branch's work is not on the default branch.
