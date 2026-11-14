@@ -32,6 +32,14 @@ git worktrees-clean ../my-feature
 git worktrees-clean --include-locked ../my-feature
 ```
 
+```bash
+git worktrees-clean --dry-run
+```
+
+```bash
+git worktrees-clean --all-repos --dry-run
+```
+
 With no argument it checks every linked worktree of the current repository. With a path it checks only that worktree. `--include-locked` also removes that one worktree when it is locked, for a tool that locks its own worktrees while it works in them. Every other check still applies, and a worktree that is kept keeps its lock. It first fetches the default branch from `origin`, then prints what it did:
 
 ```
@@ -42,6 +50,26 @@ kept 2
   /code/app-feature-c (feature-c) - work not on origin/main
   /code/app-feature-d (feature-d) - uncommitted changes or untracked files
 ```
+
+`--dry-run` works with every form. It prints what would be removed, with each worktree's size and why, what would be kept and why, and the total size, and removes nothing. It still fetches the default branch so the answer is current, and runs `git status` without refreshing any index:
+
+```
+would remove 2
+  /code/app-feature-a (feature-a) - 412M - merged into origin/main
+  /code/app-feature-b (feature-b) - 1.2G - squash merged into origin/main
+kept 1
+  /code/app-feature-c (feature-c) - work not on origin/main
+would free 1.6G
+```
+
+`--all-repos` checks every repository on the machine instead of the current one. It looks in:
+
+- `~/Desktop/Repositories/<group>/<repo>`
+- `~/dotfiles`
+- `~/git-worktrees/<repo>` and `~/git-worktrees/<repo>/<worktree>`
+- `<repo>/.claude/worktrees/<worktree>` of each of those
+
+and checks every repository that owns one of them, once per repository. It never reads a folder whose name starts with `SMBC-Leaf`, and drops a worktree whose `.git` file points into one before git looks at it. It does not ask for passwords while fetching, and a repository it cannot check is listed under `skipped` with the reason.
 
 ## What counts as merged
 
@@ -60,10 +88,12 @@ A branch counts as merged when either check passes:
 
 ## What keeps a worktree
 
-1. It is locked (`git worktree lock`), unless it was named with `--include-locked`.
-2. It has no branch checked out.
-3. It has uncommitted changes or untracked files. Files matched by ignore rules, such as `node_modules/`, do not keep it.
-4. Its branch's work is not on the default branch.
+1. The command runs from inside it, unless it was named as the path.
+2. With `--all-repos`, its git index or HEAD changed in the last 24 hours, since an open session may still be using it.
+3. It is locked (`git worktree lock`), unless it was named with `--include-locked`.
+4. It has no branch checked out.
+5. It has uncommitted changes or untracked files. Files matched by ignore rules, such as `node_modules/`, do not keep it.
+6. Its branch's work is not on the default branch.
 
 A worktree whose directory was already deleted has git's record of it pruned (`git worktree prune`). Its branch is deleted only if its work is on the default branch.
 
@@ -71,10 +101,10 @@ A worktree whose directory was already deleted has git's record of it pruned (`g
 
 | Code | Meaning |
 | --- | --- |
-| 0 | finished. With a path: the worktree and its branch were removed |
-| 1 | with a path: the worktree was kept, and the reason is printed |
+| 0 | finished. With a path: the worktree and its branch were removed, or with `--dry-run` would be |
+| 1 | with a path: the worktree was kept, or with `--dry-run` would be, and the reason is printed |
 | 2 | usage error, or the path is not a linked worktree of this repository |
-| 3 | not in a git repository, `origin`'s default branch is missing, or git is older than 2.38 |
+| 3 | not in a git repository, `origin`'s default branch is missing, or git is older than 2.38. `--all-repos` lists such a repository under `skipped` and carries on |
 
 ## Test
 
