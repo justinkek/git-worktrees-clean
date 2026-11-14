@@ -1,30 +1,43 @@
 #!/usr/bin/env bash
 #
-# git-worktrees-clean [--include-locked <worktree-path> | <worktree-path>]
+# git-worktrees-clean [--dry-run] [--all-repos | --include-locked <worktree-path> | <worktree-path>]
 #
 # Removes each linked worktree whose branch's work has reached origin's default
 # branch, then deletes that branch. With a path, checks only that worktree.
+# With --all-repos, checks every repository found on this Mac. With --dry-run,
+# prints what it would do and changes nothing.
 # Uses git only, so it works the same with any hosting provider.
 
 set -uo pipefail
 
 usage() {
   cat <<'USAGE'
-usage: git worktrees-clean [<worktree-path>]
-       git worktrees-clean --include-locked <worktree-path>
+usage: git worktrees-clean [--dry-run] [<worktree-path>]
+       git worktrees-clean [--dry-run] --include-locked <worktree-path>
+       git worktrees-clean [--dry-run] --all-repos
 
 Removes each linked worktree whose branch's work has reached origin's default
 branch, and deletes the branch. With a path, checks only that worktree.
 --include-locked also removes that one worktree when it is locked; the other
 checks still apply.
 
+--all-repos checks every repository under ~/Desktop/Repositories/<group>/<repo>,
+~/dotfiles and ~/git-worktrees, and every repository that owns a worktree under
+<repo>/.claude/worktrees or ~/git-worktrees. It never reads a folder whose name
+starts with SMBC-Leaf, and it also keeps a worktree whose git index or HEAD
+changed in the last 24 hours, since a session may still be using it.
+
+--dry-run prints what would be removed, with its size and reason, what would be
+kept and why, and the total size, and removes nothing.
+
 A branch counts as merged when merging it into origin's default branch would
 change nothing, or when a commit on the default branch has the same diff as
 the whole branch (a squash merge).
 
-A worktree is kept when it is locked, has no branch checked out, has
-uncommitted changes or untracked files, or its branch's work is not on the
-default branch. Files matched by ignore rules do not keep a worktree.
+A worktree is kept when the command runs from inside it (unless it is named as
+the path), it is locked, has no branch checked out, has uncommitted changes or
+untracked files, or its branch's work is not on the default branch. Files
+matched by ignore rules do not keep a worktree.
 
 Exit codes:
   0  finished (with a path: the worktree and its branch were removed)
@@ -41,10 +54,14 @@ fail() {
 
 requested_path=""
 include_locked=""
+dry_run=""
+all_repos=""
 for argument in "$@"; do
   case "$argument" in
     -h | --help) usage; exit 0 ;;
     --include-locked) include_locked=yes ;;
+    --dry-run) dry_run=yes ;;
+    --all-repos) all_repos=yes ;;
     -*) usage >&2; exit 2 ;;
     *)
       [ -z "$requested_path" ] || { usage >&2; exit 2; }
@@ -52,9 +69,27 @@ for argument in "$@"; do
       ;;
   esac
 done
+if [ -n "$all_repos" ] && [ -n "$requested_path" ]; then
+  fail "--all-repos does not take a worktree path." 2
+fi
 if [ -n "$include_locked" ] && [ -z "$requested_path" ]; then
   fail "--include-locked needs a worktree path." 2
 fi
+
+# git status would otherwise refresh each worktree's index, which changes it on
+# a dry run and makes every worktree look recently used.
+export GIT_OPTIONAL_LOCKS=0
+
+if [ -n "$all_repos" ]; then
+  # Many repositories are fetched in a row, so none may stop to ask for a
+  # password.
+  export GIT_TERMINAL_PROMPT=0
+  [ -n "${GIT_SSH_COMMAND:-}" ] || export GIT_SSH_COMMAND="ssh -o BatchMode=yes"
+fi
+
+starting_directory="$(pwd -P)"
+now="$(date +%s)"
+recent_seconds=$((24 * 60 * 60))
 
 # A relative path is read from where the command was run, before moving to the
 # main checkout.
@@ -69,33 +104,87 @@ if [ -n "$requested_path" ]; then
   fi
 fi
 
-common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ||
-  fail "not inside a git repository." 3
-main_checkout="$(dirname "$common_dir")"
-cd "$main_checkout" || fail "cannot enter the main checkout at $main_checkout." 3
+# True when any folder in the path has a name starting with SMBC-Leaf.
+is_excluded() {
+  case "/$1/" in
+    */SMBC-Leaf*) return 0 ;;
+  esac
+  return 1
+}
 
-git merge-tree --write-tree HEAD HEAD > /dev/null 2>&1 ||
-  fail "needs git 2.38 or later for 'git merge-tree --write-tree'." 3
+modified_seconds() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
 
-default_reference="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)"
-default_branch="${default_reference#origin/}"
-[ -n "$default_branch" ] || default_branch=main
-target="origin/$default_branch"
+human_size() {
+  awk -v kilobytes="$1" 'BEGIN {
+    split("K M G T", units, " ")
+    size = kilobytes
+    unit = 1
+    while (size >= 1024 && unit < 4) { size /= 1024; unit++ }
+    if (unit == 1 || size >= 10) printf "%d%s", size + 0.5, units[unit]
+    else printf "%.1f%s", size, units[unit]
+  }'
+}
 
-git fetch --quiet origin "$default_branch" 2>/dev/null ||
-  printf 'git worktrees-clean: could not fetch %s, checking against the copy already on disk\n' "$target" >&2
+removed=""
+kept=""
+skipped=""
+vanished=""
+free_kilobytes=0
+main_checkout=""
+problem=""
+problem_code=0
 
-git rev-parse --verify --quiet "$target^{commit}" > /dev/null ||
-  fail "$target does not exist. Set it with 'git remote set-head origin --auto'." 3
-target_tree="$(git rev-parse "$target^{tree}")"
+# Moves to the repository whose common git dir is $1 and reads its default
+# branch. On failure sets $problem and $problem_code and returns 1.
+prepare_repository() {
+  local common_dir="$1" default_reference
+
+  if [ "$(git --git-dir="$common_dir" rev-parse --is-bare-repository 2>/dev/null)" = true ]; then
+    main_checkout="$common_dir"
+  else
+    main_checkout="$(dirname "$common_dir")"
+  fi
+  if ! cd "$main_checkout"; then
+    problem="cannot enter the main checkout at $main_checkout."
+    problem_code=3
+    return 1
+  fi
+
+  if ! git merge-tree --write-tree HEAD HEAD > /dev/null 2>&1; then
+    problem="needs git 2.38 or later for 'git merge-tree --write-tree'."
+    problem_code=3
+    return 1
+  fi
+
+  default_reference="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)"
+  default_branch="${default_reference#origin/}"
+  [ -n "$default_branch" ] || default_branch=main
+  target="origin/$default_branch"
+
+  if ! git fetch --quiet origin "$default_branch" 2>/dev/null; then
+    printf 'git worktrees-clean: could not fetch %s%s, checking against the copy already on disk\n' \
+      "$target" "${all_repos:+ in $main_checkout}" >&2
+  fi
+
+  if ! git rev-parse --verify --quiet "$target^{commit}" > /dev/null; then
+    problem="$target does not exist. Set it with 'git remote set-head origin --auto'."
+    problem_code=3
+    return 1
+  fi
+  target_tree="$(git rev-parse "$target^{tree}")"
+}
 
 # True when the branch's work is on the default branch: merging it would change
 # nothing, or a commit since the fork point has the same diff as the whole branch.
+# Sets $merge_kind to say which.
 is_merged() {
   local branch="$1" merged_tree fork_point branch_fingerprint
 
   if merged_tree="$(git merge-tree --write-tree "$target" "$branch" 2>/dev/null)" &&
     [ "${merged_tree%%$'\n'*}" = "$target_tree" ]; then
+    merge_kind="merged into $target"
     return 0
   fi
 
@@ -103,20 +192,53 @@ is_merged() {
   branch_fingerprint="$(git diff "$fork_point" "$branch" | git patch-id --stable | cut -d' ' -f1)"
   [ -n "$branch_fingerprint" ] || return 1
 
+  merge_kind="squash merged into $target"
   git log --patch --no-merges --format='commit %H' "$fork_point..$target" |
     git patch-id --stable | cut -d' ' -f1 | grep --quiet --line-regexp --fixed-strings "$branch_fingerprint"
 }
 
-removed=""
-kept=""
-vanished=""
+# True when the command was run from inside the worktree.
+is_current() {
+  local real_path
+  real_path="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+  case "$starting_directory/" in
+    "$real_path"/*) return 0 ;;
+  esac
+  return 1
+}
+
+# True when the worktree's index or HEAD changed in the last 24 hours.
+is_recent() {
+  local git_dir name modified
+  git_dir="$(git -C "$1" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+  for name in index HEAD; do
+    modified="$(modified_seconds "$git_dir/$name")" || continue
+    [ -n "$modified" ] || continue
+    [ $((now - modified)) -lt "$recent_seconds" ] && return 0
+  done
+  return 1
+}
 
 keep() {
   kept="${kept}$1"$'\n'
 }
 
+would_remove() {
+  local worktree_path="$1" branch="$2" reason="$3" kilobytes
+
+  kilobytes="$(du -sk "$worktree_path" 2>/dev/null | cut -f 1)"
+  [ -n "$kilobytes" ] || kilobytes=0
+  free_kilobytes=$((free_kilobytes + kilobytes))
+  removed="${removed}${worktree_path} ($branch) - $(human_size "$kilobytes") - $reason"$'\n'
+}
+
 check_worktree() {
   local worktree_path="$1" branch="$2" locked="$3" outstanding
+
+  if [ -z "$requested_path" ] && is_current "$worktree_path"; then
+    keep "$worktree_path${branch:+ ($branch)} - this command runs from it"
+    return
+  fi
 
   if [ -n "$locked" ] && [ -z "$include_locked" ]; then
     keep "$worktree_path${branch:+ ($branch)} - locked"
@@ -140,6 +262,11 @@ check_worktree() {
     return
   fi
 
+  if [ -n "$all_repos" ] && is_recent "$worktree_path"; then
+    keep "$worktree_path ($branch) - used in the last 24 hours"
+    return
+  fi
+
   if ! outstanding="$(git -C "$worktree_path" status --porcelain 2>/dev/null)"; then
     keep "$worktree_path ($branch) - cannot read its working tree"
     return
@@ -151,6 +278,11 @@ check_worktree() {
 
   if ! is_merged "$branch"; then
     keep "$worktree_path ($branch) - work not on $target"
+    return
+  fi
+
+  if [ -n "$dry_run" ]; then
+    would_remove "$worktree_path" "$branch" "$merge_kind"
     return
   fi
 
@@ -173,63 +305,164 @@ check_vanished() {
   local worktree_path branch
 
   [ -n "$vanished" ] || return
-  git worktree prune
+  [ -n "$dry_run" ] || git worktree prune
 
   while IFS=$'\t' read -r worktree_path branch; do
     [ -n "$worktree_path" ] || continue
     if ! is_merged "$branch"; then
       keep "$worktree_path ($branch) - directory already gone, branch kept: work not on $target"
+    elif [ -n "$dry_run" ]; then
+      removed="${removed}${worktree_path} ($branch) - directory was already gone, branch would be deleted"$'\n'
     elif git branch --delete --force --quiet "$branch"; then
       removed="${removed}${worktree_path} ($branch) - directory was already gone"$'\n'
     else
       keep "$worktree_path ($branch) - directory already gone, but git would not delete the branch"
     fi
   done <<< "$vanished"
+  vanished=""
 }
 
+# Checks the linked worktrees in a `git worktree list --porcelain` listing.
+# git always lists the main worktree first, so the first entry is skipped.
 found_requested=""
-worktree_path=""
-branch=""
-locked=""
-lock_reason=""
-while IFS= read -r line; do
-  case "$line" in
-    "worktree "*)
-      worktree_path="${line#worktree }"
-      branch=""
-      locked=""
-      lock_reason=""
-      ;;
-    "branch refs/heads/"*)
-      branch="${line#branch refs/heads/}"
-      ;;
-    "locked")
-      locked=yes
-      lock_reason=""
-      ;;
-    "locked "*)
-      locked=yes
-      lock_reason="${line#locked }"
-      ;;
-    "")
-      if [ -n "$worktree_path" ] && [ "$worktree_path" != "$main_checkout" ]; then
-        if [ -z "$requested_path" ]; then
-          check_worktree "$worktree_path" "$branch" "$locked"
-        elif [ "$worktree_path" = "$requested_path" ]; then
-          found_requested=yes
-          check_worktree "$worktree_path" "$branch" "$locked"
+check_listing() {
+  local listing="$1" line entry=0 worktree_path="" branch="" locked=""
+
+  lock_reason=""
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*)
+        entry=$((entry + 1))
+        worktree_path="${line#worktree }"
+        branch=""
+        locked=""
+        lock_reason=""
+        ;;
+      "branch refs/heads/"*)
+        branch="${line#branch refs/heads/}"
+        ;;
+      "locked")
+        locked=yes
+        lock_reason=""
+        ;;
+      "locked "*)
+        locked=yes
+        lock_reason="${line#locked }"
+        ;;
+      "")
+        if [ -n "$worktree_path" ] && [ "$entry" -gt 1 ] && ! is_excluded "$worktree_path"; then
+          if [ -z "$requested_path" ]; then
+            check_worktree "$worktree_path" "$branch" "$locked"
+          elif [ "$worktree_path" = "$requested_path" ]; then
+            found_requested=yes
+            check_worktree "$worktree_path" "$branch" "$locked"
+          fi
         fi
-      fi
-      worktree_path=""
-      ;;
+        worktree_path=""
+        ;;
+    esac
+  done <<< "$listing"$'\n'
+}
+
+# Adds the repository at $1 to $common_dirs, once per common git dir. A
+# worktree whose .git file points into an SMBC-Leaf folder is dropped before
+# git reads anything there.
+common_dirs=""
+add_candidate() {
+  local directory="$1" line="" common
+
+  is_excluded "$directory" && return
+  if [ -f "$directory/.git" ]; then
+    IFS= read -r line < "$directory/.git"
+    case "$line" in
+      "gitdir: "*) is_excluded "${line#gitdir: }" && return ;;
+      *) return ;;
+    esac
+  elif [ ! -d "$directory/.git" ] && { [ ! -f "$directory/HEAD" ] || [ ! -d "$directory/objects" ]; }; then
+    return
+  fi
+
+  common="$(git -C "$directory" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return
+  common="$(cd "$common" 2>/dev/null && pwd -P)" || return
+  is_excluded "$common" && return
+  case $'\n'"$common_dirs" in
+    *$'\n'"$common"$'\n'*) return ;;
   esac
-done < <(git worktree list --porcelain; printf '\n')
+  common_dirs="${common_dirs}${common}"$'\n'
+}
 
-if [ -n "$requested_path" ] && [ -z "$found_requested" ]; then
-  fail "$requested_path is not a linked worktree of this repository." 2
+# Prints each folder directly inside $1. A name starting with SMBC-Leaf is
+# dropped before anything looks inside it.
+subdirectories() {
+  local parent="$1" child
+  is_excluded "$parent" && return
+  [ -d "$parent" ] || return
+  for child in "$parent"/*; do
+    is_excluded "$child" && continue
+    [ -d "$child" ] && printf '%s\n' "$child"
+  done
+  return 0
+}
+
+add_with_claude_worktrees() {
+  local directory="$1" worktree
+  add_candidate "$directory"
+  while IFS= read -r worktree; do
+    add_candidate "$worktree"
+  done < <(subdirectories "$directory/.claude/worktrees")
+}
+
+find_repositories() {
+  local group repository worktree
+
+  while IFS= read -r group; do
+    while IFS= read -r repository; do
+      add_with_claude_worktrees "$repository"
+    done < <(subdirectories "$group")
+  done < <(subdirectories "$HOME/Desktop/Repositories")
+
+  add_with_claude_worktrees "$HOME/dotfiles"
+
+  while IFS= read -r group; do
+    add_with_claude_worktrees "$group"
+    while IFS= read -r worktree; do
+      add_with_claude_worktrees "$worktree"
+    done < <(subdirectories "$group")
+  done < <(subdirectories "$HOME/git-worktrees")
+}
+
+if [ -n "$all_repos" ]; then
+  shopt -s nullglob
+  find_repositories
+  while IFS= read -r common_dir; do
+    [ -n "$common_dir" ] || continue
+    if ! listing="$(git --git-dir="$common_dir" worktree list --porcelain 2>/dev/null)"; then
+      skipped="${skipped}${common_dir} - git cannot list its worktrees"$'\n'
+      continue
+    fi
+    # A repository with only its main worktree has nothing to check, so it is
+    # not fetched.
+    [ "$(printf '%s\n' "$listing" | grep --count '^worktree ')" -gt 1 ] || continue
+    main_checkout=""
+    if ! prepare_repository "$common_dir"; then
+      skipped="${skipped}${main_checkout:-$common_dir} - $problem"$'\n'
+      continue
+    fi
+    check_listing "$(git worktree list --porcelain)"
+    check_vanished
+  done <<< "$common_dirs"
+else
+  common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ||
+    fail "not inside a git repository." 3
+  prepare_repository "$common_dir" || fail "$problem" "$problem_code"
+  check_listing "$(git worktree list --porcelain)"
+
+  if [ -n "$requested_path" ] && [ -z "$found_requested" ]; then
+    fail "$requested_path is not a linked worktree of this repository." 2
+  fi
+
+  check_vanished
 fi
-
-check_vanished
 
 print_group() {
   local label="$1" body="$2" count=0
@@ -240,7 +473,13 @@ print_group() {
   return 0
 }
 
-print_group removed "$removed"
+if [ -n "$dry_run" ]; then
+  print_group "would remove" "$removed"
+else
+  print_group removed "$removed"
+fi
 print_group kept "$kept"
+[ -z "$all_repos" ] || [ -z "$skipped" ] || print_group skipped "$skipped"
+[ -z "$dry_run" ] || printf 'would free %s\n' "$(human_size "$free_kilobytes")"
 
 [ -z "$requested_path" ] || [ -z "$kept" ]
