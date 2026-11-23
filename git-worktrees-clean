@@ -24,8 +24,15 @@ checks still apply.
 --all-repos checks every repository under ~/Desktop/Repositories/<group>/<repo>,
 ~/dotfiles and ~/git-worktrees, and every repository that owns a worktree under
 <repo>/.claude/worktrees or ~/git-worktrees. It never reads a folder whose name
-starts with Client-Repo, and it also keeps a worktree whose git index or HEAD
-changed in the last 24 hours, since a session may still be using it.
+starts with a prefix listed in the excluded file, and it also keeps a worktree
+whose git index or HEAD changed in the last 24 hours, since a session may still
+be using it. A run without --all-repos ignores the excluded file, so it checks
+an excluded repository it runs in, or one of its worktrees named as the path.
+
+The excluded file is ~/.config/git-worktrees-clean/excluded, or
+$XDG_CONFIG_HOME/git-worktrees-clean/excluded when XDG_CONFIG_HOME is set. It
+holds one folder-name prefix per line; blank lines and lines starting with #
+are ignored. With no file, nothing is excluded.
 
 --dry-run prints what would be removed, with its size and reason, what would be
 kept and why, and the total size, and removes nothing.
@@ -104,11 +111,31 @@ if [ -n "$requested_path" ]; then
   fi
 fi
 
-# True when any folder in the path has a name starting with Client-Repo.
+# Folder-name prefixes --all-repos leaves alone, one per line, each ending in a
+# newline.
+excluded_file="${XDG_CONFIG_HOME:-$HOME/.config}/git-worktrees-clean/excluded"
+excluded_prefixes=""
+if [ -f "$excluded_file" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    case "$line" in
+      "" | "#"*) continue ;;
+    esac
+    excluded_prefixes="${excluded_prefixes}${line}"$'\n'
+  done < "$excluded_file"
+fi
+
+# True when any folder in the path has a name starting with an excluded prefix.
 is_excluded() {
-  case "/$1/" in
-    */Client-Repo*) return 0 ;;
-  esac
+  local remaining="$excluded_prefixes" prefix
+  while [ -n "$remaining" ]; do
+    prefix="${remaining%%$'\n'*}"
+    remaining="${remaining#*$'\n'}"
+    case "/$1/" in
+      */"$prefix"*) return 0 ;;
+    esac
+  done
   return 1
 }
 
@@ -350,7 +377,8 @@ check_listing() {
         lock_reason="${line#locked }"
         ;;
       "")
-        if [ -n "$worktree_path" ] && [ "$entry" -gt 1 ] && ! is_excluded "$worktree_path"; then
+        if [ -n "$worktree_path" ] && [ "$entry" -gt 1 ] &&
+          { [ -z "$all_repos" ] || ! is_excluded "$worktree_path"; }; then
           if [ -z "$requested_path" ]; then
             check_worktree "$worktree_path" "$branch" "$locked"
           elif [ "$worktree_path" = "$requested_path" ]; then
@@ -365,7 +393,7 @@ check_listing() {
 }
 
 # Adds the repository at $1 to $common_dirs, once per common git dir. A
-# worktree whose .git file points into an Client-Repo folder is dropped before
+# worktree whose .git file points into an excluded folder is dropped before
 # git reads anything there.
 common_dirs=""
 add_candidate() {
@@ -391,8 +419,8 @@ add_candidate() {
   common_dirs="${common_dirs}${common}"$'\n'
 }
 
-# Prints each folder directly inside $1. A name starting with Client-Repo is
-# dropped before anything looks inside it.
+# Prints each folder directly inside $1. A name starting with an excluded
+# prefix is dropped before anything looks inside it.
 subdirectories() {
   local parent="$1" child
   is_excluded "$parent" && return

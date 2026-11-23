@@ -69,7 +69,16 @@ would free 1.6G
 - `~/git-worktrees/<repo>` and `~/git-worktrees/<repo>/<worktree>`
 - `<repo>/.claude/worktrees/<worktree>` of each of those
 
-and checks every repository that owns one of them, once per repository. It never reads a folder whose name starts with `Client-Repo`, and drops a worktree whose `.git` file points into one before git looks at it. It does not ask for passwords while fetching, and a repository it cannot check is listed under `skipped` with the reason.
+and checks every repository that owns one of them, once per repository. It never reads a folder whose name starts with a prefix in the excluded file, and drops a worktree whose `.git` file points into one before git looks at it. It does not ask for passwords while fetching, and a repository it cannot check is listed under `skipped` with the reason.
+
+## Excluded folders
+
+`~/.config/git-worktrees-clean/excluded`, or `$XDG_CONFIG_HOME/git-worktrees-clean/excluded` when `XDG_CONFIG_HOME` is set, lists folder-name prefixes that `--all-repos` never reads, one per line. Blank lines and lines starting with `#` are ignored. With no file, nothing is excluded. A run without `--all-repos` ignores the file: run from inside an excluded repository, or naming one of its worktrees, it checks and cleans it like any other. The file is local to the machine and is not part of this repository:
+
+```
+# a client's repositories
+Client-Repo
+```
 
 ## What counts as merged
 

@@ -18,6 +18,12 @@ export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
 export GIT_CONFIG_GLOBAL="$TMPDIR/gitconfig"
 export GIT_CONFIG_SYSTEM=/dev/null
 
+# The excluded file names a made-up client, so no real one is in the tests,
+# and the user's own file is never read.
+export XDG_CONFIG_HOME="$TMPDIR/config"
+mkdir -p "$XDG_CONFIG_HOME/git-worktrees-clean"
+printf '# a comment\n\n  Client-Repo  \n' > "$XDG_CONFIG_HOME/git-worktrees-clean/excluded"
+
 # Builds "$1/checkout" with "$1/origin.git" as origin, each with one commit on main.
 make_repository() {
   local root="$1"
@@ -317,7 +323,7 @@ printf "\nTest group: every repository on the Mac\n"
 
 # HOME is a temp folder, so only the repositories built here are found.
 # A git wrapper logs where each git command ran and what it named, to show
-# nothing reads an Client-Repo folder.
+# nothing reads an excluded folder.
 home="$TMPDIR/home"
 origins="$TMPDIR/origins"
 mkdir -p "$home" "$origins" "$TMPDIR/bin"
@@ -392,6 +398,9 @@ worktree_there() {
   [ -d "$1" ] && git -C "$1" rev-parse --verify --quiet HEAD > /dev/null
 }
 
+output="$(cd "$alpha/.claude/worktrees/here" && HOME="$home" XDG_CONFIG_HOME="$TMPDIR/no-config" "$CLEAN" --all-repos --dry-run 2>&1)"
+assert_reports "with no excluded file, nothing is excluded" "would remove 5" "$output"
+
 : > "$GIT_LOG"
 output="$(cd "$alpha/.claude/worktrees/here" && HOME="$home" PATH="$TMPDIR/bin:$PATH" "$CLEAN" --all-repos --dry-run 2>&1)"
 status=$?
@@ -419,19 +428,36 @@ if worktree_there "$alpha/.claude/worktrees/here"; then ok "keeps the worktree i
 assert_reports "says why the current worktree stayed" "(alpha-here) - this command runs from it" "$output"
 
 if worktree_there "$client/.claude/worktrees/done" && worktree_there "$home/git-worktrees/Client-Repo.worktrees/done"; then
-  ok "leaves Client-Repo worktrees alone"
+  ok "leaves worktrees of an excluded folder alone"
 else
-  ko "removed an Client-Repo worktree"
+  ko "removed a worktree of an excluded folder"
 fi
-if printf '%s' "$output" | grep --quiet Client-Repo; then ko "names Client-Repo in its output"; else ok "never names Client-Repo"; fi
+if printf '%s' "$output" | grep --quiet Client-Repo; then ko "names an excluded folder in its output"; else ok "never names an excluded folder"; fi
 if grep --quiet Client-Repo "$GIT_LOG"; then
-  ko "ran git in or on an Client-Repo folder:"
+  ko "ran git in or on an excluded folder:"
   grep Client-Repo "$GIT_LOG"
 elif [ -s "$GIT_LOG" ]; then
-  ok "never runs git in or on an Client-Repo folder"
+  ok "never runs git in or on an excluded folder"
 else
   ko "the git wrapper logged nothing, so the check proves nothing"
 fi
+
+printf "\nTest group: an excluded repository without --all-repos\n"
+
+output="$(cd "$client" && HOME="$home" "$CLEAN" --dry-run 2>&1)"
+status=$?
+if [ "$status" -eq 0 ]; then ok "a dry run from inside it exits 0"; else ko "a dry run from inside it exits $status"; printf '%s\n' "$output"; fi
+assert_reports "a dry run from inside it checks its worktrees" "would remove 2" "$output"
+
+output="$(cd "$client" && HOME="$home" "$CLEAN" "$client/.claude/worktrees/done" 2>&1)"
+status=$?
+if [ "$status" -eq 0 ]; then ok "exits 0 for one of its worktrees named as the path"; else ko "exits $status for one of its worktrees named as the path"; printf '%s\n' "$output"; fi
+if ! worktree_there "$client/.claude/worktrees/done"; then ok "removes one of its worktrees named as the path"; else ko "kept its named worktree"; fi
+
+output="$(cd "$client" && HOME="$home" "$CLEAN" 2>&1)"
+status=$?
+if [ "$status" -eq 0 ]; then ok "exits 0 run from inside it"; else ko "exits $status run from inside it"; printf '%s\n' "$output"; fi
+if ! worktree_there "$home/git-worktrees/Client-Repo.worktrees/done"; then ok "run from inside it, removes its merged worktrees"; else ko "run from inside it, kept its merged worktree"; fi
 
 (cd "$alpha" && HOME="$home" "$CLEAN" --all-repos "$alpha/.claude/worktrees/fresh" > /dev/null 2>&1)
 status=$?
